@@ -7,140 +7,262 @@ const cron = IS_VERCEL ? null : require("node-cron");
 
 const app = express();
 const PORT = process.env.PORT || 7001;
-const TOP_RATED_THRESHOLD = 7.0;
+const VERSION = require("./package.json").version;
 
-const SOURCES = {
-  movies: "https://raw.githubusercontent.com/crazyuploader/IMDb-Top-50/main/data/popular/movies.json",
-  shows: "https://raw.githubusercontent.com/crazyuploader/IMDb-Top-50/main/data/popular/shows.json",
+// ---------------------------------------------------------------------------
+// IMDb GraphQL source
+// ---------------------------------------------------------------------------
+
+const IMDB_GQL = "https://api.graphql.imdb.com/";
+
+// The WAF checks that x-imdb-client-name is present; without it every request
+// is a bare 403. The locale pair pins titles and certificates to en-US —
+// IMDb localises otherwise, e.g. country=EE returns "Ämblikmees. Täitsa uus päev".
+const IMDB_HEADERS = {
+  "content-type": "application/json",
+  "x-imdb-client-name": "imdb-web-next",
+  "x-imdb-user-country": "US",
+  "x-imdb-user-language": "en-US",
 };
 
+const CHART_SIZE = 100; // MOST_POPULAR_* charts are 100 long
+const TRENDING_POOL = 250; // one call covers both types, ~120 each
+const CATALOG_LIMIT = 40; // length of the derived trending / top-rated rows
+const MIN_VOTES = 5000; // keeps unreleased announcements out of derived rows
+
+// The trending feed mixes every title type IMDb tracks, so map explicitly
+// rather than treating "not a series" as a movie. tvSpecial in particular is
+// isSeries=false and would otherwise be published as a film — currently
+// "The Punisher: One Last Kill", 51k votes, so well clear of MIN_VOTES.
+const STREMIO_TYPE = {
+  movie: "movie",
+  tvMovie: "movie",
+  tvSeries: "series",
+  tvMiniSeries: "series",
+};
+
+const TITLE_FIELDS = `
+  id
+  titleText { text }
+  titleType { id }
+  releaseYear { year }
+  primaryImage { url }
+  ratingsSummary { aggregateRating voteCount }
+  runtime { seconds }
+  certificate { rating }
+  titleGenres { genres { genre { text } } }
+  plot { plotText { plainText } }
+  principalCreditsV2 { grouping { text } credits { name { nameText { text } } } }
+`;
+
+const CHART_QUERY = `query Chart($chart: ChartTitleType!, $n: Int!) {
+  chartTitles(first: $n, chart: {chartType: $chart}) {
+    edges { node { ${TITLE_FIELDS} } }
+  }
+}`;
+
+// IMDb's own traffic-weighted trending, already ranked. Mixes types, so it is
+// split on titleType.isSeries rather than by making two calls.
+const TRENDING_QUERY = `query Trending($n: Int!) {
+  topTrendingTitles(first: $n, input: {dataWindow: HOURS, trafficSource: XWW}) {
+    edges { node { rank item { ${TITLE_FIELDS} } } }
+  }
+}`;
+
 // ---------------------------------------------------------------------------
-// Data stores
+// Data store
 // ---------------------------------------------------------------------------
 
-const allMetas = { movies: [], shows: [] };
-const genreSets = { movie: new Set(), series: new Set() };
+const store = {
+  popular: { movie: [], series: [] },
+  trending: { movie: [], series: [] },
+  topRated: { movie: [], series: [] },
+  genres: { movie: [], series: [] },
+  fetchedAt: null,
+};
+
+const CACHE_PATH = process.env.CACHE_PATH || path.join(__dirname, "cache.json");
 
 // ---------------------------------------------------------------------------
 // TTL cache (Vercel serverless uses this; Docker uses node-cron instead)
 // ---------------------------------------------------------------------------
 
-let lastRefresh = 0;
 let refreshPromise = null;
 const CACHE_TTL = 6 * 60 * 60 * 1000; // 6 hours
 
 async function ensureData() {
-  const now = Date.now();
-  if (allMetas.movies.length > 0 && now - lastRefresh < CACHE_TTL) return;
+  const fresh = store.fetchedAt && Date.now() - store.fetchedAt < CACHE_TTL;
+  if (store.popular.movie.length > 0 && fresh) return;
   if (refreshPromise) return refreshPromise;
   refreshPromise = refreshAll()
-    .then(() => { lastRefresh = Date.now(); })
     .catch((e) => { console.error("[ensureData] refresh failed:", e.message); })
     .finally(() => { refreshPromise = null; });
   return refreshPromise;
 }
 
 // ---------------------------------------------------------------------------
-// Utility helpers
+// Transformation
 // ---------------------------------------------------------------------------
 
-async function fetchJSON(url) {
-  const { default: fetch } = await import("node-fetch").catch(() => ({ default: globalThis.fetch }));
-  const fn = fetch || globalThis.fetch;
-  let res = await fn(url, { redirect: "follow" });
-  if ([301, 302, 307, 308].includes(res.status)) {
-    const loc = res.headers.get("location");
-    if (loc) res = await fn(loc, { redirect: "follow" });
-  }
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+// IMDb labels credit groups in both singular and plural — Director/Directors,
+// Creator/Creators, Star/Stars — so an exact match silently drops multi-credit
+// titles.
+const DIRECTOR_GROUP = /^(director|creator)s?$/i;
+const CAST_GROUP = /^stars?$/i;
+
+function creditNames(groups, pattern) {
+  const group = (groups || []).find((g) => pattern.test(g.grouping?.text || ""));
+  if (!group) return null;
+  const names = (group.credits || [])
+    .map((c) => c.name?.nameText?.text)
+    .filter(Boolean);
+  return names.length ? names : null;
 }
 
-function decodeEntities(str) {
-  if (!str || typeof str !== "string") return str;
-  return str
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
-}
+function nodeToMeta(node, type) {
+  if (!node || !node.id) return null;
+  const meta = { id: node.id, type, name: node.titleText?.text || "Unknown" };
 
-function extractImdbId(item) {
-  if (item.imdb_id) return item.imdb_id;
-  if (item.id && String(item.id).startsWith("tt")) return item.id;
-  const link = item.url || item.link || "";
-  const m = link.match(/tt\d{7,}/);
-  return m ? m[0] : null;
-}
+  if (node.primaryImage?.url) meta.poster = node.primaryImage.url;
+  if (node.plot?.plotText?.plainText) meta.description = node.plot.plotText.plainText;
+  if (node.releaseYear?.year) meta.year = String(node.releaseYear.year);
+  if (node.certificate?.rating) meta.certification = node.certificate.rating;
 
-function parseRankChange(str) {
-  if (!str || typeof str !== "string") return 0;
-  const m = str.match(/(UP|DOWN)\s+(\d+)/i);
-  if (!m) return 0;
-  return (m[1].toUpperCase() === "UP" ? 1 : -1) * parseInt(m[2], 10);
-}
+  const rating = node.ratingsSummary?.aggregateRating;
+  if (rating != null) meta.imdbRating = String(rating);
 
-// ---------------------------------------------------------------------------
-// Data transformation & loading
-// ---------------------------------------------------------------------------
+  const genres = (node.titleGenres?.genres || [])
+    .map((g) => g.genre?.text)
+    .filter(Boolean);
+  if (genres.length) meta.genres = genres;
 
-function toStremioMeta(item, type) {
-  const id = extractImdbId(item);
-  if (!id) return null;
-  const meta = { id, type, name: decodeEntities(item.title || item.name || "Unknown") };
-  if (item.poster || item.image) meta.poster = item.poster || item.image;
-  if (item.rating) meta.imdbRating = String(item.rating);
-  if (item.plot) meta.description = decodeEntities(item.plot);
-  if (item.genres) {
-    const g = typeof item.genres === "string" ? item.genres.split(/,\s*/) : item.genres;
-    if (Array.isArray(g) && g.length) meta.genres = g;
-  }
-  if (item.runtime) {
-    const mins = Number(item.runtime);
+  const seconds = node.runtime?.seconds;
+  if (seconds) {
+    const mins = Math.round(seconds / 60);
     meta.runtime = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}min` : `${mins} min`;
   }
-  if (item.year) meta.year = String(item.year);
-  if (item.certificate) meta.certification = item.certificate;
-  if (item.directors) meta.director = Array.isArray(item.directors) ? item.directors : [item.directors];
-  if (item.stars) meta.cast = typeof item.stars === "string" ? item.stars.split(/,\s*/) : item.stars;
+
+  const director = creditNames(node.principalCreditsV2, DIRECTOR_GROUP);
+  if (director) meta.director = director;
+  const cast = creditNames(node.principalCreditsV2, CAST_GROUP);
+  if (cast) meta.cast = cast;
+
   // Internal — stripped before serving to Stremio
-  meta._rankChange = parseRankChange(item.meterRankChange);
+  meta._votes = node.ratingsSummary?.voteCount || 0;
   return meta;
 }
 
-function collectGenres(metaList, type) {
-  genreSets[type] = new Set();
-  for (const m of metaList) {
-    if (m.genres) m.genres.forEach((g) => genreSets[type].add(g));
+function collectGenres(metas) {
+  const set = new Set();
+  for (const m of metas) {
+    if (m.genres) m.genres.forEach((g) => set.add(g));
+  }
+  return [...set].sort();
+}
+
+// "Popular right now AND good": the popular chart re-ordered by rating rather
+// than by meter rank. A fixed rating threshold does not work here because IMDb
+// TV ratings run a full point above film ratings (medians 8.0 vs 7.0), so 7.0
+// keeps half the movies but 83% of the series.
+function deriveTopRated(popular) {
+  return popular
+    .filter((m) => m.imdbRating && m._votes >= MIN_VOTES)
+    .sort((a, b) => parseFloat(b.imdbRating) - parseFloat(a.imdbRating))
+    .slice(0, CATALOG_LIMIT);
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+async function gql(query, variables) {
+  const res = await fetch(IMDB_GQL, {
+    method: "POST",
+    headers: IMDB_HEADERS,
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const body = await res.json();
+  if (body.errors) throw new Error(body.errors.map((e) => e.message).join("; "));
+  return body.data;
+}
+
+async function fetchChart(chartType, type) {
+  const data = await gql(CHART_QUERY, { chart: chartType, n: CHART_SIZE });
+  return (data.chartTitles?.edges || [])
+    .map((e) => nodeToMeta(e.node, type))
+    .filter(Boolean);
+}
+
+async function fetchTrending() {
+  const data = await gql(TRENDING_QUERY, { n: TRENDING_POOL });
+  const out = { movie: [], series: [] };
+  for (const edge of data.topTrendingTitles?.edges || []) {
+    const item = edge.node?.item;
+    const type = STREMIO_TYPE[item?.titleType?.id];
+    if (!type) continue;
+    const meta = nodeToMeta(item, type);
+    // Native rank order is the edge order, so no re-sorting. The floor drops
+    // announcements with no audience yet, which otherwise lead the row.
+    if (meta && meta._votes >= MIN_VOTES && out[type].length < CATALOG_LIMIT) {
+      out[type].push(meta);
+    }
+  }
+  return out;
+}
+
+function saveCache() {
+  try {
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(store));
+  } catch (e) {
+    // Read-only filesystem on Vercel; the in-memory copy still serves.
+    console.error("[cache] Write failed:", e.message);
   }
 }
 
-async function refreshCatalog(key, url, type) {
+function loadCache() {
+  if (!fs.existsSync(CACHE_PATH)) return false;
   try {
-    const data = await fetchJSON(url);
-    const items = Array.isArray(data) ? data : data.items || data.results || [];
-    const results = items.map((i) => toStremioMeta(i, type)).filter(Boolean);
-    if (results.length > 0) {
-      allMetas[key] = results;
-      collectGenres(results, type);
-      const trending = results.filter((m) => m._rankChange > 0).length;
-      const topRated = results.filter(
-        (m) => m.imdbRating && parseFloat(m.imdbRating) >= TOP_RATED_THRESHOLD
-      ).length;
-      console.log(
-        `[${key}] ${results.length} items | ${trending} trending | ${topRated} top-rated | ${genreSets[type].size} genres`
-      );
-    }
+    const saved = JSON.parse(fs.readFileSync(CACHE_PATH, "utf8"));
+    if (!saved.popular?.movie?.length) return false;
+    Object.assign(store, saved);
+    const age = Math.round((Date.now() - store.fetchedAt) / 3600000);
+    console.log(`[cache] Restored ${store.popular.movie.length} movies, ${age}h old`);
+    return true;
   } catch (e) {
-    console.error(`[${key}] Refresh failed:`, e.message);
+    console.error("[cache] Read failed:", e.message);
+    return false;
   }
 }
 
 async function refreshAll() {
-  await Promise.all([
-    refreshCatalog("movies", SOURCES.movies, "movie"),
-    refreshCatalog("shows", SOURCES.shows, "series"),
+  const [movies, series, trending] = await Promise.all([
+    fetchChart("MOST_POPULAR_MOVIES", "movie"),
+    fetchChart("MOST_POPULAR_TV_SHOWS", "series"),
+    fetchTrending(),
   ]);
+
+  // Every list is replaced or none is, so a partial failure leaves the previous
+  // snapshot serving rather than half-updating it.
+  if (!movies.length || !series.length) {
+    throw new Error(`empty chart (movies=${movies.length} series=${series.length})`);
+  }
+
+  store.popular = { movie: movies, series };
+  store.trending = trending;
+  store.topRated = { movie: deriveTopRated(movies), series: deriveTopRated(series) };
+  store.genres = { movie: collectGenres(movies), series: collectGenres(series) };
+  store.fetchedAt = Date.now();
+
+  for (const type of ["movie", "series"]) {
+    console.log(
+      `[${type}] ${store.popular[type].length} popular | ` +
+        `${store.trending[type].length} trending | ` +
+        `${store.topRated[type].length} top-rated | ` +
+        `${store.genres[type].length} genres`
+    );
+  }
+  saveCache();
 }
 
 // ---------------------------------------------------------------------------
@@ -158,34 +280,26 @@ function parseExtra(str) {
   return result;
 }
 
-function stripInternal({ _rankChange, ...clean }) {
+function stripInternal({ _votes, ...clean }) {
   return clean;
 }
 
 function resolveCatalog(type, id, extra) {
-  const key = type === "movie" ? "movies" : "shows";
-  let list = allMetas[key];
-  if (!list || !list.length) return [];
+  if (type !== "movie" && type !== "series") return [];
 
-  // Base selection by catalog type
-  if (id.startsWith("imdb-trending-")) {
-    list = list
-      .filter((m) => m._rankChange > 0)
-      .sort((a, b) => b._rankChange - a._rankChange);
-  } else if (id.startsWith("imdb-top-rated-")) {
-    list = list
-      .filter((m) => m.imdbRating && parseFloat(m.imdbRating) >= TOP_RATED_THRESHOLD)
-      .sort((a, b) => parseFloat(b.imdbRating) - parseFloat(a.imdbRating));
-  } else if (!id.startsWith("imdb-popular-")) {
-    return [];
-  }
+  let list;
+  if (id.startsWith("imdb-popular-")) list = store.popular[type];
+  else if (id.startsWith("imdb-trending-")) list = store.trending[type];
+  else if (id.startsWith("imdb-top-rated-")) list = store.topRated[type];
+  else return [];
 
-  // Genre filter
+  if (!list.length) return [];
+
   if (extra.genre) {
     list = list.filter((m) => m.genres && m.genres.includes(extra.genre));
   }
 
-  // Search filter — matches title, description, cast, and director
+  // Search matches title, description, cast, and director
   if (extra.search) {
     const q = extra.search.toLowerCase();
     list = list.filter(
@@ -197,7 +311,6 @@ function resolveCatalog(type, id, extra) {
     );
   }
 
-  // Pagination
   const skip = parseInt(extra.skip) || 0;
   if (skip > 0) list = list.slice(skip);
 
@@ -209,19 +322,13 @@ function resolveCatalog(type, id, extra) {
 // ---------------------------------------------------------------------------
 
 function buildManifest(proto, host) {
-  const movieGenres = [...genreSets.movie].sort();
-  const seriesGenres = [...genreSets.series].sort();
-
-  const movieExtras = [
-    { name: "genre", options: movieGenres },
+  const extrasFor = (type) => [
+    { name: "genre", options: store.genres[type] },
     { name: "search" },
     { name: "skip" },
   ];
-  const seriesExtras = [
-    { name: "genre", options: seriesGenres },
-    { name: "search" },
-    { name: "skip" },
-  ];
+  const movieExtras = extrasFor("movie");
+  const seriesExtras = extrasFor("series");
 
   return {
     stremioAddonsConfig: {
@@ -230,7 +337,7 @@ function buildManifest(proto, host) {
         "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..G-1w-gbjMK8hs2Gr8aYivw.ktgQJPi38gdApAgHbuF5xHOdHum70ITuae6Fvgp8HvDmrB-ymxxInHwkPjw-ak2kp7iEEersXEh7lLV_GZEYEKa7KQ9XAbsnp4zm-zpIcMsjZvVdevRfRXXN7FTHJrSj.Kk6vdgPh8M-3yUCNp2-4tQ",
     },
     id: "community.imdb-popular",
-    version: "2.0.0",
+    version: VERSION,
     name: "IMDb Popular",
     description:
       "IMDb Most Popular Movies & TV Shows — trending, top-rated, genre filtering, and search",
@@ -248,6 +355,11 @@ function buildManifest(proto, host) {
     behaviorHints: { configurable: false },
     idPrefixes: ["tt"],
   };
+}
+
+function originOf(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
+  return { proto, host: req.headers.host };
 }
 
 // ---------------------------------------------------------------------------
@@ -279,11 +391,7 @@ async function ensureLogo() {
       console.log(`[logo] Loaded from cache: ${logoBuf.length} bytes`);
       return;
     }
-    const { default: fetch } = await import("node-fetch").catch(() => ({
-      default: globalThis.fetch,
-    }));
-    const fn = fetch || globalThis.fetch;
-    const res = await fn(LOGO_URL);
+    const res = await fetch(LOGO_URL);
     if (res.ok) {
       logoBuf = Buffer.from(await res.arrayBuffer());
       try { fs.writeFileSync(LOGO_PATH, logoBuf); } catch (_) { /* read-only on Vercel */ }
@@ -295,10 +403,11 @@ async function ensureLogo() {
 }
 
 // Landing page
-app.get('/', (req, res) => {
-  const manifest = buildManifest();
-  res.setHeader('Content-Type', 'text/html');
-  res.setHeader('Cache-Control', 'public, max-age=3600, s-maxage=86400');
+app.get("/", (req, res) => {
+  const { proto, host } = originOf(req);
+  const manifest = buildManifest(proto, host);
+  res.setHeader("Content-Type", "text/html");
+  res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=86400");
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -387,16 +496,15 @@ app.get('/', (req, res) => {
     <img src="/logo.png" alt="${manifest.name}" class="logo">
     <h1>${manifest.name}</h1>
     <p class="description">${manifest.description}</p>
-    <a href="stremio://imdb-popular-stremio.vercel.app/manifest.json" class="install-btn">Install to Stremio</a>
+    <a href="stremio://${host}/manifest.json" class="install-btn">Install to Stremio</a>
     <div class="catalogs">
-      ${manifest.catalogs.map(c => `<span class="catalog-tag">${c.name}</span>`).join('\n      ')}
+      ${manifest.catalogs.map((c) => `<span class="catalog-tag">${c.name}</span>`).join("\n      ")}
     </div>
   </div>
   <footer>v${manifest.version} &middot; <a href="/manifest.json">Manifest</a></footer>
 </body>
 </html>`);
 });
-
 
 app.get("/logo.png", async (_, res) => {
   await ensureLogo();
@@ -410,8 +518,8 @@ app.get("/logo.png", async (_, res) => {
 app.get("/manifest.json", (req, res) => {
   hits.manifest++;
   res.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-  const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
-  res.json(buildManifest(proto, req.headers.host));
+  const { proto, host } = originOf(req);
+  res.json(buildManifest(proto, host));
 });
 
 app.get("/catalog/:type/:id.json", (req, res) => {
@@ -428,22 +536,25 @@ app.get("/catalog/:type/:id/:extra.json", (req, res) => {
   });
 });
 
+// Counts are per catalog so a monitor can alert on a row shrinking, not just on
+// the data going stale. Both failures look identical from the outside otherwise.
 app.get("/status", (_, res) => {
   res.set("Cache-Control", "no-cache");
-  const stats = (key, type) => ({
-    count: allMetas[key].length,
-    trending: allMetas[key].filter((m) => m._rankChange > 0).length,
-    topRated: allMetas[key].filter(
-      (m) => m.imdbRating && parseFloat(m.imdbRating) >= TOP_RATED_THRESHOLD
-    ).length,
-    genres: [...genreSets[type]].sort(),
+  const stats = (type) => ({
+    popular: store.popular[type].length,
+    trending: store.trending[type].length,
+    topRated: store.topRated[type].length,
+    genres: store.genres[type],
   });
   res.json({
     status: "ok",
-    version: "2.0.0",
+    version: VERSION,
+    source: "imdb-graphql",
+    fetchedAt: store.fetchedAt ? new Date(store.fetchedAt).toISOString() : null,
+    ageSeconds: store.fetchedAt ? Math.round((Date.now() - store.fetchedAt) / 1000) : null,
     hits,
-    movies: stats("movies", "movie"),
-    shows: stats("shows", "series"),
+    movies: stats("movie"),
+    shows: stats("series"),
   });
 });
 
@@ -454,13 +565,16 @@ app.get("/status", (_, res) => {
 module.exports = app;
 
 if (!IS_VERCEL) {
-  Promise.all([refreshAll(), ensureLogo()]).then(() => {
-    lastRefresh = Date.now();
+  loadCache();
+  Promise.all([
+    refreshAll().catch((e) => console.error("[boot] Refresh failed:", e.message)),
+    ensureLogo(),
+  ]).then(() => {
     cron.schedule("0 */6 * * *", () => {
-      refreshAll().then(() => { lastRefresh = Date.now(); });
+      refreshAll().catch((e) => console.error("[cron] Refresh failed:", e.message));
     });
     app.listen(PORT, "0.0.0.0", () =>
-      console.log(`IMDb Popular addon v2.0.0 on :${PORT}`)
+      console.log(`IMDb Popular addon v${VERSION} on :${PORT}`)
     );
   });
 }

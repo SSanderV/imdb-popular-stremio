@@ -1,6 +1,6 @@
 {
   "name": "imdb-popular-stremio-addon",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Stremio addon serving IMDb popular movies and series catalogs",
   "main": "index.js",
   "scripts": {
