@@ -211,11 +211,16 @@ async function fetchTrending() {
   return out;
 }
 
+// The disk cache exists so a container restart does not serve empty catalogs
+// while IMDb is unreachable. Vercel has no persistent disk and no restart to
+// protect — ensureData already keeps warm invocations populated — and its
+// filesystem is read-only, so attempting the write there only produces an error
+// on every refresh.
 function saveCache() {
+  if (IS_VERCEL) return;
   try {
     fs.writeFileSync(CACHE_PATH, JSON.stringify(store));
   } catch (e) {
-    // Read-only filesystem on Vercel; the in-memory copy still serves.
     console.error("[cache] Write failed:", e.message);
   }
 }
