@@ -1,0 +1,27 @@
+#!/bin/sh
+# gitleaks scans staged CONTENT, which is the only check that catches a credential pasted into an
+# otherwise-innocent file. Filename-based .gitignore patterns are a cheap second net, not a
+# substitute.
+#
+# This repository is pushed to GitHub, so a secret committed here reaches a public remote, and once
+# it is in history it survives deletion unless the history is rewritten.
+#
+# Enable with: git config core.hooksPath .githooks
+# core.hooksPath is not carried by git clone, so every fresh clone has to set it again and nothing
+# reports that it has not been set.
+
+set -e
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "ERROR: gitleaks not found; refusing to commit unscanned content." >&2
+    echo "Install it with: winget install Gitleaks.Gitleaks" >&2
+    exit 1
+fi
+
+# --staged scans what is about to be committed, not the whole history.
+if ! gitleaks git --staged --redact --no-banner; then
+    echo >&2
+    echo "ERROR: commit blocked - gitleaks found a possible secret in staged content." >&2
+    echo "Remove it. If it is a false positive, add a rule to .gitleaks.toml." >&2
+    exit 1
+fi
