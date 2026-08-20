@@ -25,18 +25,19 @@
 
 ## Install in Stremio
 
-Deploy the addon first (see below), then:
+A hosted instance runs at **https://imdb-popular-stremio.vercel.app**.
 
 1. Open **Stremio** and go to the **Addons** page (puzzle piece icon)
-2. Enter your addon URL in the search bar at the top:
+2. Enter the addon URL in the search bar at the top:
    ```
-   https://<your-deployment>/manifest.json
+   https://imdb-popular-stremio.vercel.app/manifest.json
    ```
 3. Click **Install**
 
-Or open your deployment's root URL in a browser and use the **Install to Stremio** button.
+Or open the [landing page](https://imdb-popular-stremio.vercel.app) and use the **Install to Stremio** button.
 
-Six new catalogs appear on your home screen.
+Six new catalogs appear on your home screen. To run your own copy instead, see [Deploy](#deploy) and
+substitute your own URL.
 
 > **Stremio Web** needs the addon to be reachable over HTTPS from your browser. A plain
 > `http://<ip>:7001` addon works in the desktop app but not on the web client.
@@ -45,8 +46,13 @@ Six new catalogs appear on your home screen.
 
 ### Vercel
 
-The repository is serverless-ready: `api/index.js` re-exports the Express app and `vercel.json`
-rewrites every path to it. Import the repository in Vercel and deploy, no configuration required.
+Import the repository in Vercel and **set the Framework Preset to Express**. The repository is
+serverless-ready: `api/index.js` re-exports the Express app and `vercel.json` rewrites every path
+to it. No build command, output directory or environment variables are needed.
+
+The preset matters. With **Other**, Vercel publishes the repository root as static files, and its
+filesystem check runs before `vercel.json` rewrites, so `/` serves `index.js` as source instead of
+reaching the app.
 
 There is no persistent disk on Vercel, so the disk cache is skipped and `node-cron` is never loaded.
 Data is refreshed lazily instead: the first request after the 6 hour TTL expires triggers a refresh.
