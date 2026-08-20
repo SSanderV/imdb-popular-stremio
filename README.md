@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  A <a href="https://www.stremio.com/">Stremio</a> addon that brings <strong>IMDb Most Popular</strong>, <strong>Trending</strong> and <strong>Top Rated</strong> catalogs for movies and TV series to your home screen, with genre filtering and search. Runs as a Docker container or on Vercel.
+  A <a href="https://www.stremio.com/">Stremio</a> addon that brings <strong>IMDb Most Popular</strong>, <strong>Trending</strong> and <strong>Top Rated</strong> catalogs for movies and TV series to your home screen, with genre filtering and search. Use the hosted instance, or self-host with Docker.
 </p>
 
 ---
@@ -44,20 +44,6 @@ substitute your own URL.
 
 ## Deploy
 
-### Vercel
-
-Import the repository in Vercel and **set the Framework Preset to Express**. The repository is
-serverless-ready: `api/index.js` re-exports the Express app and `vercel.json` rewrites every path
-to it. No build command, output directory or environment variables are needed.
-
-The preset matters. With **Other**, Vercel publishes the repository root as static files, and its
-filesystem check runs before `vercel.json` rewrites, so `/` serves `index.js` as source instead of
-reaching the app.
-
-There is no persistent disk on Vercel, so the disk cache is skipped and `node-cron` is never loaded.
-Data is refreshed lazily instead: the first request after the 6 hour TTL expires triggers a refresh.
-Edge cache headers on the catalog and manifest routes keep that from happening on most requests.
-
 ### Docker
 
 ```bash
@@ -90,6 +76,22 @@ node index.js
 
 Available at `http://localhost:7001/manifest.json`. Node 18 or newer is required, since the addon
 uses the built-in `fetch`.
+
+### Vercel
+
+How the public instance above is deployed, kept here because the settings are not obvious.
+
+Import the repository in Vercel and **set the Framework Preset to Express**. The repository is
+serverless-ready: `api/index.js` re-exports the Express app and `vercel.json` rewrites every path
+to it. No build command, output directory or environment variables are needed.
+
+The preset matters. With **Other**, Vercel publishes the repository root as static files, and its
+filesystem check runs before `vercel.json` rewrites, so `/` serves `index.js` as source instead of
+reaching the app.
+
+There is no persistent disk on Vercel, so the disk cache is skipped and `node-cron` is never loaded.
+Data is refreshed lazily instead: the first request after the 6 hour TTL expires triggers a refresh.
+Edge cache headers on the catalog and manifest routes keep that from happening on most requests.
 
 ## Configuration
 
