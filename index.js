@@ -384,7 +384,7 @@ app.use(async (req, res, next) => {
 
 // Logo ---
 const LOGO_URL =
-  "https://raw.githubusercontent.com/QuietAnima/imdb-popular-stremio/main/logo.png";
+  "https://raw.githubusercontent.com/SSanderV/imdb-popular-stremio/main/logo.png";
 const LOGO_PATH = path.join(__dirname, "logo.png");
 let logoBuf = null;
 
