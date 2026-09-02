@@ -74,8 +74,8 @@ npm install --omit=dev
 node index.js
 ```
 
-Available at `http://localhost:7001/manifest.json`. Node 18 or newer is required, since the addon
-uses the built-in `fetch`.
+Available at `http://localhost:7001/manifest.json`. Node 20 or newer is required: `node-cron` 4
+sets that floor, above what the addon's own use of the built-in `fetch` needs.
 
 ### Vercel
 
@@ -152,7 +152,7 @@ than by treating "not a series" as a film: `movie` and `tvMovie` become movies, 
 
 ## Tech Stack
 
-- **Runtime:** Node.js 18+ (Docker image is `node:20-slim`)
+- **Runtime:** Node.js 20+ (Docker image is `node:20-slim`)
 - **Server:** Express 4
 - **Scheduling:** node-cron when self-hosted, TTL when serverless
 - **Data:** IMDb GraphQL
